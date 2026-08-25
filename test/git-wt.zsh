@@ -11,7 +11,8 @@ temporary_directory=$(mktemp --directory)
 trap 'rm --recursive --force -- "$temporary_directory"' EXIT
 
 readonly REPOSITORY="${temporary_directory}/repository"
-export PATH="${PROJECT_ROOT}:${PATH}"
+source "${PROJECT_ROOT}/git-wt.plugin.zsh"
+source "${PROJECT_ROOT}/git-wt.plugin.zsh"
 
 fail() {
   print -ru2 -- "test failure: $1"
@@ -32,6 +33,10 @@ assert_status() {
   (( actual == expected )) || fail "expected status ${expected}, got ${actual}"
 }
 
+assert_empty_file() {
+  [[ ! -s $1 ]] || fail "expected empty file $1"
+}
+
 mkdir --parents -- "$REPOSITORY"
 git -C "$REPOSITORY" init --quiet
 git -C "$REPOSITORY" config user.email 'git-wt-test@example.com'
@@ -42,11 +47,11 @@ git -C "$REPOSITORY" commit --quiet --message 'seed'
 
 (
   cd -- "$REPOSITORY"
-  git wt init
+  git wt --init
 )
 assert_file "${REPOSITORY}/.gitignore"
 assert_file "${REPOSITORY}/.wtinit"
-[[ "$(<"${REPOSITORY}/.gitignore")" == '/.worktrees/' ]] || fail 'init wrote the wrong ignore entry'
+[[ "$(<"${REPOSITORY}/.gitignore")" == '/.worktrees/' ]] || fail '--init wrote the wrong ignore entry'
 
 cat > "${REPOSITORY}/.wtinit" <<'EOF'
 #!/usr/bin/env zsh
@@ -56,81 +61,110 @@ readonly CUSTOM_INIT_CONTENT=$(<"${REPOSITORY}/.wtinit")
 
 (
   cd -- "$REPOSITORY"
-  git wt init
-  git wt add alpha
+  git wt --init
+  git wt alpha 2> "${temporary_directory}/create-status"
+  [[ $PWD == "${REPOSITORY}/.worktrees/alpha" ]] || fail 'create did not change to the worktree'
 )
-[[ "$(<"${REPOSITORY}/.wtinit")" == "$CUSTOM_INIT_CONTENT" ]] || fail 'init replaced an existing .wtinit'
+[[ "$(<"${temporary_directory}/create-status")" == 'creating worktree…' ]] || fail 'create printed the wrong status'
+[[ "$(<"${REPOSITORY}/.wtinit")" == "$CUSTOM_INIT_CONTENT" ]] || fail '--init replaced an existing .wtinit'
 [[ "$(<"${REPOSITORY}/init-cwd")" == "${REPOSITORY}/.worktrees/alpha" ]] || fail '.wtinit used the wrong current directory'
 assert_directory "${REPOSITORY}/.worktrees/alpha"
+
+(
+  cd -- "$REPOSITORY"
+  git wt alpha > "${temporary_directory}/switch-output" 2> "${temporary_directory}/switch-error"
+  [[ $PWD == "${REPOSITORY}/.worktrees/alpha" ]] || fail 'switch did not change to the worktree'
+)
+assert_empty_file "${temporary_directory}/switch-output"
+assert_empty_file "${temporary_directory}/switch-error"
 
 git -C "$REPOSITORY" branch existing
 (
   cd -- "$REPOSITORY"
-  git wt add existing
+  git wt existing 2>/dev/null
+  [[ $PWD == "${REPOSITORY}/.worktrees/existing" ]] || fail 'existing branch create did not change directory'
 )
-[[ "$(git -C "${REPOSITORY}/.worktrees/existing" branch --show-current)" == existing ]] || fail 'add did not use the existing branch'
+[[ "$(git -C "${REPOSITORY}/.worktrees/existing" branch --show-current)" == existing ]] || fail 'create did not use the existing branch'
 
 (
   cd -- "${REPOSITORY}/.worktrees/alpha"
-  git wt add beta
+  git wt beta 2>/dev/null
+  [[ $PWD == "${REPOSITORY}/.worktrees/beta" ]] || fail 'linked create did not change directory'
 )
 assert_directory "${REPOSITORY}/.worktrees/beta"
-[[ "$(git -C "${REPOSITORY}/.worktrees/beta" branch --show-current)" == beta ]] || fail 'linked add created the wrong branch'
+[[ "$(git -C "${REPOSITORY}/.worktrees/beta" branch --show-current)" == beta ]] || fail 'linked create created the wrong branch'
+
+_describe() {
+  print -rl -- "${worktrees[@]}"
+}
+local completion_names
+completion_names=$(
+  cd -- "$REPOSITORY"
+  _git_wt_managed_worktrees
+)
+unfunction _describe
+local -a completion_worktrees=("${(f)completion_names}")
+[[ ${completion_worktrees[(r)alpha]} == alpha ]] || fail 'completions omitted alpha'
+[[ ${completion_worktrees[(r)beta]} == beta ]] || fail 'completions omitted beta'
+[[ ${completion_worktrees[(r)existing]} == existing ]] || fail 'completions omitted existing'
 
 print -r -- 'dirty' >> "${REPOSITORY}/.worktrees/alpha/seed.txt"
 local remove_status
 if (
-  cd -- "$REPOSITORY"
-  git wt rm alpha
-) 2> "${temporary_directory}/remove-error"; then
-  fail 'rm removed a dirty worktree without --force'
+  cd -- "${REPOSITORY}/.worktrees/alpha"
+  remove_status=0
+  git wt --rm alpha 2> "${temporary_directory}/remove-error" || remove_status=$?
+  (( remove_status != 0 )) || fail '--rm removed a dirty worktree without --force'
+  [[ $PWD == "${REPOSITORY}/.worktrees/alpha" ]] || fail 'failed removal did not restore the current directory'
+  return "$remove_status"
+); then
+  fail '--rm removed a dirty worktree without --force'
 else
   remove_status=$?
 fi
 assert_status 1 "$remove_status"
-[[ "$(<"${temporary_directory}/remove-error")" == *'Git could not remove worktree alpha'* ]] || fail 'rm did not log its failure'
+[[ "$(<"${temporary_directory}/remove-error")" == *'Git could not remove worktree alpha'* ]] || fail '--rm did not log its failure'
 
 (
-  cd -- "$REPOSITORY"
-  git wt rm --force alpha
+  cd -- "${REPOSITORY}/.worktrees/alpha"
+  git wt --rm --force alpha
+  [[ $PWD == "$REPOSITORY" ]] || fail 'removal from the worktree did not change to the repository root'
 )
-[[ ! -e "${REPOSITORY}/.worktrees/alpha" ]] || fail 'forced rm left the worktree directory'
-git -C "$REPOSITORY" show-ref --verify --quiet refs/heads/alpha || fail 'rm deleted the worktree branch'
+[[ ! -e "${REPOSITORY}/.worktrees/alpha" ]] || fail 'forced --rm left the worktree directory'
+git -C "$REPOSITORY" show-ref --verify --quiet refs/heads/alpha || fail '--rm deleted the worktree branch'
 
 cat > "${REPOSITORY}/.wtinit" <<EOF
 #!/usr/bin/env zsh
 exit ${INIT_FAILURE_STATUS}
 EOF
-local add_status
+local create_status
 if (
   cd -- "$REPOSITORY"
-  git wt add failed-init
-) 2> "${temporary_directory}/add-error"; then
-  fail 'add succeeded after .wtinit failed'
+  git wt failed-init
+) 2> "${temporary_directory}/create-error"; then
+  fail 'create succeeded after .wtinit failed'
 else
-  add_status=$?
+  create_status=$?
 fi
-assert_status "$INIT_FAILURE_STATUS" "$add_status"
+assert_status "$INIT_FAILURE_STATUS" "$create_status"
 assert_directory "${REPOSITORY}/.worktrees/failed-init"
-[[ "$(<"${temporary_directory}/add-error")" == *'.wtinit failed for worktree failed-init'* ]] || fail 'add did not log the init failure'
+[[ "$(<"${temporary_directory}/create-error")" == *'creating worktree…'* ]] || fail 'failed create omitted its status'
+[[ "$(<"${temporary_directory}/create-error")" == *'.wtinit failed for worktree failed-init'* ]] || fail 'create did not log the init failure'
 
 (
   cd -- "$REPOSITORY"
-  git wt rm beta
-  git wt rm existing
-  git wt rm --force failed-init
+  git wt --rm beta
+  git wt --rm existing
+  git wt --rm --force failed-init
 )
 
 local completions_file="${temporary_directory}/_git-wt"
 (
   cd -- "$REPOSITORY"
-  git wt completions
+  git wt --completions
 ) > "$completions_file"
 zsh -n "$completions_file"
 [[ "$(<"$completions_file")" == *'_git_wt_managed_worktrees'* ]] || fail 'completions omitted managed worktrees'
-
-mkdir --parents -- "${temporary_directory}/home"
-HOME="${temporary_directory}/home" "${PROJECT_ROOT}/install.zsh" >/dev/null
-[[ -x "${temporary_directory}/home/.local/bin/git-wt" ]] || fail 'installer did not create an executable'
+[[ "$(<"$completions_file")" == *'--rm[remove a managed worktree]'* ]] || fail 'completions omitted --rm'
 
 print -r -- 'All integration checks passed.'
