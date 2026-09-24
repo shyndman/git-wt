@@ -20,7 +20,20 @@ git() {
   command git "$@"
 }
 
+_git_wt_complete_git() {
+  if [[ ${words[2]-} != wt ]]; then
+    _git "$@"
+    return
+  fi
+
+  local -a words=("${words[@]}")
+  local -i CURRENT=$CURRENT
+  shift words
+  (( CURRENT-- ))
+  _git-wt "$@"
+}
+
 if (( ${+functions[compdef]} )); then
-  compdef _git git
+  compdef _git_wt_complete_git git g
   compdef _git-wt git-wt
 fi

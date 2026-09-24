@@ -13,9 +13,10 @@ _git_wt_log_error() {
 }
 
 _git_wt_print_usage() {
-  print -r -- 'usage: git wt [--force] <worktree>'
-  print -r -- '       git wt --rm [--force] <worktree>'
-  print -r -- '       git wt <--init|--completions>'
+  print -r -- 'usage: git wt <worktree> [--force]'
+  print -r -- '       git wt --rm <worktree> [--force]'
+  print -r -- '       git wt --init'
+  print -r -- '       git wt --completions'
 }
 
 _git_wt_repository_root() {
@@ -298,6 +299,18 @@ _git_wt_managed_worktrees() {
 }
 
 _git-wt() {
+  if (( CURRENT == 2 )) && [[ -z ${words[CURRENT]} ]]; then
+    local -a options=(
+      '--init:initialize worktree files'
+      '--completions:print Zsh completions'
+      '--rm:remove a managed worktree'
+      '--force:pass force behavior to git worktree'
+    )
+    _describe -O -t options 'option' options
+    _git_wt_managed_worktrees
+    return
+  fi
+
   _arguments -s \
     '--init[initialize worktree files]' \
     '--completions[print Zsh completions]' \
