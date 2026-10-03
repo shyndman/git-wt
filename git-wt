@@ -4,9 +4,7 @@ emulate -LR zsh
 setopt NO_UNSET PIPE_FAIL
 
 typeset -gr GIT_WT_PROGRAM_NAME='git wt'
-typeset -gr GIT_WT_WORKTREES_DIRECTORY_NAME='.worktrees'
 typeset -gr GIT_WT_INIT_SCRIPT_NAME='.wtinit'
-typeset -gr GIT_WT_IGNORE_ENTRY='/.worktrees/'
 
 _git_wt_log_error() {
   print -ru2 -- "${GIT_WT_PROGRAM_NAME}: $1"
@@ -45,43 +43,6 @@ _git_wt_validate_name() {
   fi
 }
 
-_git_wt_append_ignore_entry() {
-  local -r ignore_file=$1
-  local line
-  local found=false
-  local last_character
-
-  if [[ -f $ignore_file ]]; then
-    while IFS= read -r line || [[ -n $line ]]; do
-      if [[ $line == $GIT_WT_IGNORE_ENTRY ]]; then
-        found=true
-        break
-      fi
-    done < "$ignore_file"
-  fi
-
-  if [[ $found == true ]]; then
-    return 0
-  fi
-
-  if [[ -s $ignore_file ]]; then
-    if ! last_character=$(tail --bytes=1 -- "$ignore_file"); then
-      _git_wt_log_error "could not read ${ignore_file}"
-      return 1
-    fi
-    if [[ -n $last_character ]]; then
-      print >> "$ignore_file" || {
-        _git_wt_log_error "could not add a line break to ${ignore_file}"
-        return 1
-      }
-    fi
-  fi
-
-  print -r -- "$GIT_WT_IGNORE_ENTRY" >> "$ignore_file" || {
-    _git_wt_log_error "could not update ${ignore_file}"
-    return 1
-  }
-}
 
 _git_wt_write_init_script() {
   local -r init_script=$1
@@ -111,10 +72,6 @@ _git_wt_command_init() {
 
   local root
   if ! root=$(_git_wt_repository_root); then
-    return 1
-  fi
-
-  if ! _git_wt_append_ignore_entry "${root}/.gitignore"; then
     return 1
   fi
 
@@ -159,6 +116,29 @@ _git_wt_parse_name_and_force() {
   reply=("$name" "$force")
 }
 
+_git_wt_worktrees_directory() {
+  local -r encoded_root=${${1#/}//\//--}
+  print -r -- "${HOME}/.local/share/git-wt/${encoded_root}"
+}
+
+_git_wt_resolve_worktree() {
+  local -r root=$1 name=$2
+  local external_path
+  external_path="$(_git_wt_worktrees_directory "$root")/${name}"
+  local candidate exists_status
+
+  for candidate in "$external_path" "${root}/.worktrees/${name}"; do
+    _git_wt_worktree_exists "$candidate"
+    exists_status=$?
+    if (( exists_status == 0 )); then
+      print -r -- "$candidate"
+      return 0
+    fi
+    (( exists_status == 1 )) || return "$exists_status"
+  done
+  return 1
+}
+
 _git_wt_worktree_exists() {
   local -r worktree_path=$1
   local listing
@@ -189,11 +169,11 @@ _git_wt_command_open() {
     return 1
   fi
 
-  local -r worktrees_directory="${root}/${GIT_WT_WORKTREES_DIRECTORY_NAME}"
-  local -r worktree_path="${worktrees_directory}/${name}"
+  local -r worktrees_directory=$(_git_wt_worktrees_directory "$root")
+  local worktree_path
   local -r init_script="${root}/${GIT_WT_INIT_SCRIPT_NAME}"
 
-  _git_wt_worktree_exists "$worktree_path"
+  worktree_path=$(_git_wt_resolve_worktree "$root" "$name")
   local -r exists_status=$?
   if (( exists_status == 0 )); then
     if ! builtin cd -- "$worktree_path"; then
@@ -205,6 +185,7 @@ _git_wt_command_open() {
   if (( exists_status != 1 )); then
     return 1
   fi
+  worktree_path="${worktrees_directory}/${name}"
 
   if ! mkdir --parents -- "$worktrees_directory"; then
     _git_wt_log_error "could not create ${worktrees_directory}"
@@ -249,7 +230,11 @@ _git_wt_command_remove() {
     return 1
   fi
 
-  local -r worktree_path="${root}/${GIT_WT_WORKTREES_DIRECTORY_NAME}/${name}"
+  local worktree_path
+  if ! worktree_path=$(_git_wt_resolve_worktree "$root" "$name"); then
+    _git_wt_log_error "no managed worktree named ${name}"
+    return 1
+  fi
   local -a git_arguments=(worktree remove)
   local previous_directory=''
 
@@ -276,21 +261,25 @@ _git_wt_command_remove() {
 }
 
 _git_wt_managed_worktrees() {
-  local common_directory repository_root managed_prefix line worktree_path name
+  local common_directory repository_root managed_prefix legacy_prefix line worktree_path name
   local -a worktrees=()
 
   common_directory=$(command git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
   repository_root=${common_directory:h}
-  managed_prefix="${repository_root}/${GIT_WT_WORKTREES_DIRECTORY_NAME}/"
+  managed_prefix="$(_git_wt_worktrees_directory "$repository_root")/"
+  legacy_prefix="${repository_root}/.worktrees/"
 
   while IFS= read -r line; do
     if [[ $line == worktree\ * ]]; then
       worktree_path=${line#worktree }
+      name=''
       if [[ $worktree_path == ${managed_prefix}* ]]; then
         name=${worktree_path#$managed_prefix}
-        if [[ -n $name && $name != */* ]]; then
-          worktrees+=("$name")
-        fi
+      elif [[ $worktree_path == ${legacy_prefix}* ]]; then
+        name=${worktree_path#$legacy_prefix}
+      fi
+      if [[ -n $name && $name != */* && ${worktrees[(Ie)$name]} == 0 ]]; then
+        worktrees+=("$name")
       fi
     fi
   done < <(command git worktree list --porcelain 2>/dev/null)
@@ -326,7 +315,7 @@ _git_wt_command_completions() {
   fi
 
   print -r -- '#compdef git-wt'
-  functions _git_wt_managed_worktrees _git-wt
+  functions _git_wt_worktrees_directory _git_wt_managed_worktrees _git-wt
   local -r exit_status=$?
   if (( exit_status != 0 )); then
     _git_wt_log_error 'could not write completions'
